@@ -1,0 +1,429 @@
+import serial
+import time
+import math
+import threading
+import datetime
+import csv
+import RPi.GPIO as GPIO
+
+import CanSat.NiCs2026.BNO055 as BNO055
+from CanSat.NiCs2026.micropyGPS import MicropyGPS
+
+# =====================
+# GPIO
+# =====================
+TRIG = 23
+ECHO = 24
+
+# =====================
+# 目標
+# =====================
+TARGET_LAT = 30.374239
+TARGET_LNG = 130.959967
+
+# =====================
+# センサ
+# =====================
+bmx = BNO055.BNO055()
+
+# =====================
+# 状態
+# =====================
+phase = 0
+direction = 360.0
+gps_detect = 0
+
+lat = 0.0
+lng = 0.0
+distance = 0.0
+angle = 0.0
+azimuth = 0.0
+fall = 0.0
+alt = 0.0
+
+# =====================
+# HC-SR04（安全版）
+# =====================
+def get_distance():
+    GPIO.output(TRIG, False)
+    time.sleep(0.002)
+
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    timeout = time.time()
+
+    while GPIO.input(ECHO) == 0:
+        if time.time() - timeout > 0.02:
+            return 400
+
+    start = time.time()
+
+    while GPIO.input(ECHO) == 1:
+        if time.time() - start > 0.02:
+            return 400
+
+    stop = time.time()
+    dist = (stop - start) * 34300 / 2
+    return dist
+
+
+# =====================
+# センサ
+# =====================
+def getBmxData():
+    global fall
+    acc = bmx.getAcc()
+    fall = math.sqrt(acc[0]**2 + acc[1]**2 + acc[2]**2)
+
+def calcAzimuth():
+    global azimuth
+    mag = bmx.getMag()
+    azimuth = 90 - math.degrees(math.atan2(-mag[0], mag[1]))
+    azimuth *= -1
+    azimuth %= 360
+
+def calcDistanceAngle():
+    global distance, angle
+    R = 6378137.0
+
+    dx = math.radians(TARGET_LNG - lng) * R * math.cos(math.radians(TARGET_LAT))
+    dy = math.radians(TARGET_LAT - lat) * R
+
+    distance = math.hypot(dx, dy)
+    angle = 90 - math.degrees(math.atan2(dy, dx))
+    angle %= 360
+
+def get_yaw():
+    calcAzimuth()
+    return azimuth
+
+def set_direction(val):
+    global direction
+    direction = val
+
+# =====================
+# Phase0（改良版）
+# =====================
+def phase0():
+    global phase
+
+    start = time.time()
+    fall_count = 0
+    landed_count = 0
+
+    print("Phase0: 落下検知")
+
+    while True:
+        getBmxData()
+
+        # 落下検知
+        if fall > 25:
+            fall_count += 1
+
+        if fall_count >= 8:
+            print("着地検知")
+            time.sleep(10)
+            break
+
+        if time.time() - start > 300:
+            print("timeout")
+            break
+
+        time.sleep(0.05)
+
+    phase = 1
+
+# =====================
+# Phase1
+# =====================
+def phase1():
+    global phase
+
+    print("Phase1: 特殊動作（右バック・左前進 5秒）")
+
+    # ===== モーターピン =====
+    PWMA = 18
+    AIN1 = 8
+    AIN2 = 25
+    PWMB = 10
+    BIN1 = 9
+    BIN2 = 11
+
+
+    # ===== 動作 =====
+    print("回転開始")
+
+    # 右バック
+    GPIO.output(AIN1, GPIO.LOW)
+    GPIO.output(AIN2, GPIO.HIGH)
+
+    # 左前進
+    GPIO.output(BIN1, GPIO.HIGH)
+    GPIO.output(BIN2, GPIO.LOW)
+
+    time.sleep(5)
+
+    # ===== 停止 =====
+    print("停止")
+
+    GPIO.output(AIN1, GPIO.LOW)
+    GPIO.output(AIN2, GPIO.LOW)
+    GPIO.output(BIN1, GPIO.LOW)
+    GPIO.output(BIN2, GPIO.LOW)
+
+
+    print("Phase1終了")
+
+    phase = 2
+
+# =====================
+# Phase2（完全）
+# =====================
+def phase2():
+    global phase
+
+    SAFE_DISTANCE = 100
+    SCAN_STEP = 30
+    TURN_SPEED = 400
+    ANGLE_TOL = 8
+    PWMA = 18
+    AIN1 = 8
+    AIN2 = 25
+    PWMB = 10
+    BIN1 = 9
+    BIN2 = 11
+
+
+    scan_data = []
+    start_yaw = get_yaw()
+
+    print("Phase2: 回避")
+
+    GPIO.output(AIN1, GPIO.HIGH)
+    GPIO.output(AIN2, GPIO.LOW)
+
+    # 左前進
+    GPIO.output(BIN1, GPIO.HIGH)
+    GPIO.output(BIN2, GPIO.LOW)
+
+    time.sleep(5)
+
+    # ===== 停止 =====
+    print("停止")
+
+    GPIO.output(AIN1, GPIO.LOW)
+    GPIO.output(AIN2, GPIO.LOW)
+    GPIO.output(BIN1, GPIO.LOW)
+    GPIO.output(BIN2, GPIO.LOW)
+
+    print("フェーズ2　終了")
+
+    phase = 3
+    return
+
+    
+
+# =====================
+# Phase3（GPS）
+# =====================
+def phase3():
+    global phase, direction
+
+    print("フェーズ３　GPS")
+
+    if gps_detect == 0:
+        direction = 360
+        return
+
+    calcAzimuth()
+    calcDistanceAngle()
+
+    print(f"距離:{distance:.2f}")
+
+    if distance < 5:
+        phase = 4
+        return
+
+    diff = (azimuth - angle + 540) % 360 - 180
+
+    if abs(diff) < 10:
+        direction = -360
+    elif diff > 0:
+        direction = 500
+    else:
+        direction = 600
+
+# =====================
+# Phase4（最終接近）
+# =====================
+phase4_state = "scan"
+phase4_target = 0
+
+def phase4():
+    global phase4_state, phase4_target, direction
+
+    print("フェーズ４　goal")
+
+    if phase4_state == "scan":
+        data = []
+
+        for _ in range(12):
+            set_direction(400)
+            time.sleep(0.2)
+            data.append((get_yaw(), get_distance()))
+
+        phase4_target = min(data, key=lambda x: x[1])[0]
+        phase4_state = "align"
+
+    elif phase4_state == "align":
+        diff = (phase4_target - get_yaw() + 540) % 360 - 180
+
+        if abs(diff) < 5:
+            phase4_state = "approach"
+        else:
+            direction = 600 if diff > 0 else 500
+
+    elif phase4_state == "approach":
+        d = get_distance()
+
+        if d < 20:
+            print("GOAL")
+            direction = 360
+            return
+
+        direction = -360
+
+# =====================
+# GPSスレッド
+# =====================
+def GPS_thread():
+    global lat, lng, gps_detect
+
+    s = serial.Serial("/dev/serial0", 9600)
+    gps = MicropyGPS(9, "dd")
+
+    while True:
+        line = s.readline().decode("utf-8", errors="ignore")
+
+        if len(line) < 10 or line[0] != "$":
+            continue
+
+        for c in line:
+            gps.update(c)
+
+        lat = gps.latitude[0]
+        lng = gps.longitude[0]
+        gps_detect = 1 if lat != 0 else 0
+
+# =====================
+# モータ
+# =====================
+def motor_thread():
+
+    # ===== ピン設定 =====
+    PWMA = 18
+    AIN1 = 8
+    AIN2 = 25
+    PWMB = 10
+    BIN1 = 9
+    BIN2 = 11
+
+    GPIO.setup(PWMA, GPIO.OUT)
+    GPIO.setup(AIN1, GPIO.OUT)
+    GPIO.setup(AIN2, GPIO.OUT)
+    GPIO.setup(PWMB, GPIO.OUT)
+    GPIO.setup(BIN1, GPIO.OUT)
+    GPIO.setup(BIN2, GPIO.OUT)
+
+    pwmA = GPIO.PWM(PWMA, 50)
+    pwmB = GPIO.PWM(PWMB, 50)
+
+    pwmA.start(80)
+    pwmB.start(80)
+
+    while True:
+       
+
+        # ===== 停止 =====
+        if direction == 360:
+            GPIO.output(AIN1, 0)
+            GPIO.output(AIN2, 0)
+            GPIO.output(BIN1, 0)
+            GPIO.output(BIN2, 0)
+
+        # ===== 前進 =====
+        elif direction == -360:
+            GPIO.output(AIN1, 1)
+            GPIO.output(AIN2, 0)
+            GPIO.output(BIN1, 1)
+            GPIO.output(BIN2, 0)
+
+        # ===== 左回転 =====
+        elif direction == 500:
+            GPIO.output(AIN1, 1)
+            GPIO.output(AIN2, 0)
+            GPIO.output(BIN1, 0)
+            GPIO.output(BIN2, 1)
+
+        # ===== 右回転 =====
+        elif direction == 600:
+            GPIO.output(AIN1, 0)
+            GPIO.output(AIN2, 1)
+            GPIO.output(BIN1, 1)
+            GPIO.output(BIN2, 0)
+
+        # ===== 微調整（弱回転）=====
+        elif direction > 0:
+            GPIO.output(AIN1, 1)
+            GPIO.output(AIN2, 0)
+            GPIO.output(BIN1, 0)
+            GPIO.output(BIN2, 1)
+
+        elif direction < 0:
+            GPIO.output(AIN1, 0)
+            GPIO.output(AIN2, 1)
+            GPIO.output(BIN1, 1)
+            GPIO.output(BIN2, 0)
+
+        time.sleep(0.05)
+
+# =====================
+# Setup
+# =====================
+def setup():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(TRIG, GPIO.OUT)
+    GPIO.setup(ECHO, GPIO.IN)
+
+    bmx.setUp()
+
+# =====================
+# main
+# =====================
+def main():
+    global phase
+
+    setup()
+
+    threading.Thread(target=GPS_thread, daemon=True).start()
+    threading.Thread(target=motor_thread, daemon=True).start()
+
+    while True:
+
+        if phase == 0:
+            phase0()
+        elif phase == 1:
+            phase1()
+        elif phase == 2:
+            phase2()
+        elif phase == 3:
+            phase3()
+        elif phase == 4:
+            phase4()
+
+        time.sleep(0.05)
+
+if __name__ == "__main__":
+    main()
